@@ -1,0 +1,14 @@
+tests/indexer_orchestration_test.ts
+  h_d2833f622cce50 27,49,83-135,146,610-611,613-618,621-630
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "75ec9ced0b8ca4c1ec4c330827d8b72aae9709b3",
+  "prompts": {},
+  "humans": {
+    "h_d2833f622cce50": {
+      "author": "Your Name <you@example.com>"
+    }
+  }
+}
