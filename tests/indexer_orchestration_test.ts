@@ -24,6 +24,7 @@ import type {
   RpcEvent,
 } from '../supabase/functions/_shared/stellar.ts';
 import { FACTORY_ID, factoryEvent, GROUP_ID, groupEvents } from './fixture.ts';
+import { deriveGroupState } from '../supabase/functions/_shared/state.ts';
 
 type Row = Record<string, unknown>;
 
@@ -45,7 +46,7 @@ const GROUPS_DEFAULTS: Row = {
 
 type StubCall = {
   table: string;
-  op: 'select' | 'upsert' | 'insert' | 'update';
+  op: 'select' | 'upsert' | 'insert' | 'update' | 'rpc';
 };
 
 /**
@@ -79,6 +80,59 @@ class StubSupabaseClient {
     return rows;
   }
 
+  rpc(
+    name: string,
+    params: Record<string, unknown>,
+  ): Promise<{ data: unknown; error: { message: string } | null }> {
+    this.calls.push({ table: name, op: 'rpc' });
+
+    if (name === 'derive_group_state') {
+      // Mirror the migration's aggregates over the in-memory fact tables, via
+      // the same `deriveGroupState` the equivalence test pins against the SQL.
+      const ids = (params['p_contract_ids'] as string[]) ?? [];
+      const rows = ids.map((id) => {
+        const facts = {
+          members: this.rows('group_members').filter((r) => r['contract_id'] === id)
+            .map((r) => ({ position: Number(r['position']) })),
+          contributions: this.rows('contributions').filter((r) => r['contract_id'] === id)
+            .map((r) => ({ round: Number(r['round']), amount: String(r['amount']) })),
+          payouts: this.rows('payouts').filter((r) => r['contract_id'] === id)
+            .map((r) => ({
+              round: Number(r['round']),
+              recipient_amount: String(r['recipient_amount']),
+            })),
+          fees: this.rows('protocol_fees').filter((r) => r['contract_id'] === id)
+            .map((r) => ({ round: Number(r['round']), fee: String(r['fee']) })),
+          started: this.rows('decoded_events').some((r) =>
+            r['contract_id'] === id && r['event_type'] === 'start'
+          ),
+          completed: this.rows('decoded_events').some((r) =>
+            r['contract_id'] === id && r['event_type'] === 'completed'
+          ),
+          lastEventLedger: this.rows('decoded_events')
+            .filter((r) => r['contract_id'] === id)
+            .reduce((m, r) => Math.max(m, Number(r['ledger'])), 0),
+        };
+        const derived = deriveGroupState(id, facts);
+        return {
+          contract_id: id,
+          member_count: String(derived.member_count),
+          current_round: derived.current_round,
+          completed_rounds: derived.completed_rounds,
+          contributed_total: derived.contributed_total,
+          paid_out_total: derived.paid_out_total,
+          fee_total: derived.fee_total,
+          started: derived.status !== 'open',
+          completed: derived.status === 'completed',
+          last_event_ledger: String(derived.last_event_ledger),
+        };
+      });
+      return Promise.resolve({ data: rows, error: null });
+    }
+
+    return Promise.resolve({ data: null, error: { message: `unstubbed rpc ${name}` } });
+  }
+
   callsTo(table: string, op: StubCall['op']): StubCall[] {
     return this.calls.filter((c) => c.table === table && c.op === op);
   }
@@ -89,7 +143,7 @@ type Filter = { column: string; op: 'eq' | 'in' | 'lt'; value: unknown };
 class StubBuilder {
   #client: StubSupabaseClient;
   #table: string;
-  #mode: StubCall['op'] | null = null;
+  #mode: Exclude<StubCall['op'], 'rpc'> | null = null;
   #filters: Filter[] = [];
   #maybeSingle = false;
   #upsertRows: Row[] = [];
@@ -553,10 +607,26 @@ Deno.test('handleRequest skips a range the checkpoint already covers', async () 
     const body = await response.json();
     assertEquals(body.status, 'skipped');
 
-    // Nothing but the checkpoint read happened: no events, no writes.
+    // Nothing but reads plus the latest-ledger sighting happened: no events,
+    // no checkpoint advance. The sighting keeps the lag alert's input fresh.
     assertEquals(
-      stub.calls.filter((call) => call.op !== 'select'),
+      stub.calls.filter((call) =>
+        !(
+          call.op === 'select' ||
+          (call.op === 'update' && call.table === 'indexer_checkpoints')
+        )
+      ),
       [],
+    );
+    // The checkpoint position itself was not advanced — only the observed tip
+    // was recorded alongside it.
+    assertEquals(
+      stub.rows('indexer_checkpoints')[0]?.['last_processed_ledger'],
+      SCENARIO_HEAD,
+    );
+    assertEquals(
+      stub.rows('indexer_checkpoints')[0]?.['last_seen_latest_ledger'],
+      SCENARIO_HEAD,
     );
     assertEquals(rpc.requests, []);
   } finally {
